@@ -1,15 +1,3 @@
-"""
-LangChain Multi-Tool Assistant
--------------------------------
-A single Streamlit application with three utilities:
-  1. Text Summarizer    - condenses long text into a short summary
-  2. Code Explainer     - explains Python code in plain English
-  3. CSV Query Chatbot  - chat with your CSV data in plain English
-
-Author : Vignesh Pandiya G
-Stack  : Python 3.10+, Streamlit, LangChain, OpenAI
-"""
-
 import os
 import tempfile
 import streamlit as st
