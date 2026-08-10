@@ -331,6 +331,7 @@ ChatOpenAI(model="gpt-4", temperature=0.3, openai_api_key=api_key)
 
 ---
 
-## License
+# output 
+<img width="1917" height="1077" alt="Screenshot 2026-08-10 095407" src="https://github.com/user-attachments/assets/6f1f3f6f-4dfe-428a-a7d5-80177cff6ca4" />
 
-MIT
+
