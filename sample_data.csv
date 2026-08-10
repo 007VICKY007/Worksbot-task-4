@@ -1,0 +1,16 @@
+employee_id,name,department,designation,salary,experience_years,city
+101,Arjun Kumar,Engineering,Software Engineer,85000,3,Chennai
+102,Priya Sharma,Engineering,Senior Engineer,120000,7,Bangalore
+103,Ravi Menon,Marketing,Marketing Analyst,65000,2,Mumbai
+104,Sneha Iyer,Engineering,Tech Lead,145000,10,Chennai
+105,Vikram Das,Sales,Sales Executive,55000,1,Delhi
+106,Anita Reddy,HR,HR Manager,95000,6,Hyderabad
+107,Karthik Nair,Engineering,Software Engineer,82000,2,Chennai
+108,Deepa Gupta,Marketing,Marketing Manager,110000,8,Mumbai
+109,Suresh Babu,Sales,Sales Manager,105000,9,Bangalore
+110,Meena Joshi,HR,HR Executive,60000,3,Pune
+111,Rahul Verma,Engineering,DevOps Engineer,98000,5,Chennai
+112,Lakshmi Pillai,Finance,Financial Analyst,78000,4,Hyderabad
+113,Amit Patel,Finance,Finance Manager,130000,11,Mumbai
+114,Divya Krishnan,Engineering,QA Engineer,72000,3,Bangalore
+115,Manoj Tiwari,Sales,Regional Head,140000,12,Delhi
