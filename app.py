@@ -4,13 +4,21 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_experimental.agents.agent_toolkits import create_csv_agent
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.summarize import load_summarize_chain
-from langchain.docstore.document import Document
+# ---------------------------------------------------------------------------
+# LangChain imports — every component used in this project
+# These import paths work with LangChain 0.2.x / 0.3.x (current versions).
+# ---------------------------------------------------------------------------
+from langchain_openai import ChatOpenAI                           # LLM wrapper
+from langchain_core.prompts import PromptTemplate                 # Prompt templates
+from langchain_core.output_parsers import StrOutputParser         # LCEL output parser
+from langchain_core.tools import Tool                             # Tool wrapper
+from langchain_experimental.agents.agent_toolkits import (
+    create_csv_agent,                                             # CSV agent
+)
+from langchain.memory import ConversationBufferMemory             # Chat memory
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # Text chunking
+from langchain.chains.summarize import load_summarize_chain       # Summarize chain
+from langchain_core.documents import Document                     # Document wrapper
 
 # ---------------------------------------------------------------------------
 # Load environment variables from .env file
@@ -44,13 +52,34 @@ st.markdown(
         line-height: 1.7;
         color: #1a1a1a;
     }
+    .reasoning-box {
+        background-color: #fafafa;
+        border-left: 3px solid #b0b0b0;
+        padding: 0.75rem 1rem;
+        border-radius: 4px;
+        margin-top: 0.5rem;
+        font-size: 0.88rem;
+        line-height: 1.6;
+        color: #555;
+        white-space: pre-wrap;
+    }
+    .langchain-tag {
+        display: inline-block;
+        background-color: #e8f4e8;
+        color: #2d6a2d;
+        padding: 0.15rem 0.5rem;
+        border-radius: 3px;
+        font-size: 0.78rem;
+        margin-right: 0.3rem;
+        margin-bottom: 0.3rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Sidebar — tool selector only (API key loaded from .env)
+# Sidebar
 # ---------------------------------------------------------------------------
 api_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -67,6 +96,7 @@ with st.sidebar:
         st.divider()
         if st.button("Clear conversation"):
             st.session_state["csv_chat_history"] = []
+            st.session_state.pop("csv_memory", None)
             st.rerun()
 
     st.divider()
@@ -74,7 +104,7 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# LLM — single instance per session
+# LangChain: ChatOpenAI — single LLM instance shared by all tools
 # ---------------------------------------------------------------------------
 def get_llm(api_key: str) -> ChatOpenAI:
     if "llm" not in st.session_state or st.session_state.get("_api_key") != api_key:
@@ -92,105 +122,281 @@ def get_llm(api_key: str) -> ChatOpenAI:
 # ===================================================================
 # TOOL 1 — TEXT SUMMARIZER
 #
-# LangChain components used:
-#   - RecursiveCharacterTextSplitter (splits long text into chunks)
-#   - Document (wraps each chunk)
-#   - load_summarize_chain (map_reduce summarization)
-# ===================================================================
-
-def run_summarizer(llm: ChatOpenAI, text: str) -> str:
-    """
-    Splits long text into chunks, summarizes each chunk,
-    then merges all chunk summaries into one final summary.
-    """
-    # Split the text into manageable chunks
-    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
-    chunks = splitter.split_text(text)
-
-    # Wrap each chunk as a LangChain Document
-    docs = [Document(page_content=c) for c in chunks]
-
-    # Run the map-reduce summarization chain
-    chain = load_summarize_chain(llm, chain_type="map_reduce")
-    result = chain.invoke(docs)
-
-    return result["output_text"]
-
-
-# ===================================================================
-# TOOL 2 — PYTHON CODE EXPLAINER
+# LangChain components:
+#   Tool, RecursiveCharacterTextSplitter, Document,
+#   load_summarize_chain, LCEL (prompt|llm|StrOutputParser), PromptTemplate
 #
-# LangChain components used:
-#   - PromptTemplate (structures the prompt)
-#   - LCEL chain: prompt | llm | StrOutputParser
+# Flow: Tool 1 (summarize) -> Tool 2 (explain) called in sequence
 # ===================================================================
 
-def run_code_explainer(llm: ChatOpenAI, code: str) -> str:
+def build_summarizer_tool(llm: ChatOpenAI) -> Tool:
     """
-    Takes Python code and explains it in plain English
-    that a non-technical person can understand.
+    LangChain: Tool wrapping load_summarize_chain (map_reduce).
+    Splits text into chunks, summarizes each, merges into one.
     """
+    def _run(text: str) -> str:
+        # LangChain: RecursiveCharacterTextSplitter
+        splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
+        chunks = splitter.split_text(text)
+
+        # LangChain: Document
+        docs = [Document(page_content=c) for c in chunks]
+
+        # LangChain: load_summarize_chain (map_reduce)
+        chain = load_summarize_chain(llm, chain_type="map_reduce")
+        result = chain.invoke(docs)
+        return result["output_text"]
+
+    return Tool(
+        name="text_summarizer",
+        func=_run,
+        description="Summarizes long text using map-reduce chain.",
+    )
+
+
+def build_summary_explainer_tool(llm: ChatOpenAI) -> Tool:
+    """
+    LangChain: Tool wrapping an LCEL chain (prompt | llm | StrOutputParser).
+    Takes a raw summary and explains it with reasoning.
+    """
+    # LangChain: PromptTemplate
     prompt = PromptTemplate(
-        input_variables=["code"],
+        input_variables=["raw_summary", "chunk_count", "char_count"],
         template=(
-            "You are a senior Python developer explaining code to a "
-            "non-technical manager.\n\n"
-            "Rules:\n"
-            "- Use plain English. Avoid jargon.\n"
-            "- Walk through the code step by step.\n"
-            "- Mention what the code does overall first, then break it down.\n"
-            "- If there are potential issues or improvements, note them briefly.\n\n"
-            "Code:\n```python\n{code}\n```\n\n"
-            "Explanation:"
+            "You are a summarization agent. You just summarized a long text "
+            "using a map-reduce approach.\n\n"
+            "Process details:\n"
+            "- Original text: approximately {char_count} characters\n"
+            "- Split into {chunk_count} chunk(s), summarized each, then merged\n\n"
+            "Raw summary produced:\n{raw_summary}\n\n"
+            "Now write two sections:\n\n"
+            "REASONING:\n"
+            "In 2-3 sentences, explain what the original text was about, "
+            "how many chunks you processed, and your approach.\n\n"
+            "ANSWER:\n"
+            "Present the full summary below. Keep all the important details "
+            "from the raw summary. Write clear, readable paragraphs. "
+            "Do not shorten or skip information — include everything.\n\n"
+            "Use exactly these headers: REASONING: and ANSWER:"
         ),
     )
 
-    # LCEL chain: prompt -> LLM -> extract string
+    # LangChain LCEL: prompt | llm | StrOutputParser
     chain = prompt | llm | StrOutputParser()
-    result = chain.invoke({"code": code})
 
-    return result
+    def _run(input_str: str) -> str:
+        # Parse the input: raw_summary|||chunk_count|||char_count
+        parts = input_str.split("|||")
+        return chain.invoke({
+            "raw_summary": parts[0],
+            "chunk_count": parts[1] if len(parts) > 1 else "1",
+            "char_count": parts[2] if len(parts) > 2 else "unknown",
+        })
+
+    return Tool(
+        name="summary_explainer",
+        func=_run,
+        description="Explains a raw summary with reasoning and clean formatting.",
+    )
+
+
+def run_summarizer_pipeline(llm: ChatOpenAI, text: str) -> dict:
+    """
+    Runs two LangChain Tools in sequence:
+      1. text_summarizer   — chunks and summarizes the text
+      2. summary_explainer — explains the result with reasoning
+    """
+    # Build LangChain Tools
+    summarizer = build_summarizer_tool(llm)
+    explainer = build_summary_explainer_tool(llm)
+
+    # Step 1: Run the summarizer tool
+    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
+    chunk_count = len(splitter.split_text(text))
+
+    try:
+        raw_summary = summarizer.run(text)
+    except Exception as e:
+        return {
+            "reasoning": f"Summarization failed: {str(e)[:200]}",
+            "answer": (
+                "Sorry, there was an error while summarizing. "
+                "This can happen if the text is very long or if "
+                "OpenAI's servers are temporarily overloaded. "
+                "Try again with a shorter text, or wait a moment and retry."
+            ),
+        }
+
+    # Step 2: Run the explainer tool
+    try:
+        explainer_input = f"{raw_summary}|||{chunk_count}|||{len(text)}"
+        explained = explainer.run(explainer_input)
+    except Exception:
+        # If explainer fails, return the raw summary directly
+        explained = f"REASONING:\nSummarized the text in {chunk_count} chunks.\n\nANSWER:\n{raw_summary}"
+
+    # Build the execution log
+    agent_log = (
+        f"Step 1:\n"
+        f"  Tool used: text_summarizer\n"
+        f"  Input: [{len(text)} characters of text]\n"
+        f"  Chunks created: {chunk_count}\n"
+        f"  Output: [{len(raw_summary)} characters of raw summary]\n\n"
+        f"Step 2:\n"
+        f"  Tool used: summary_explainer\n"
+        f"  Input: raw summary + metadata\n"
+        f"  Output: explained summary with reasoning"
+    )
+
+    parsed = _parse_reasoning_answer(explained, raw_summary)
+    parsed["agent_steps"] = agent_log
+    return parsed
+
+
+# ===================================================================
+# TOOL 2 — CODE EXPLAINER
+#
+# LangChain components:
+#   Tool, LCEL (prompt|llm|StrOutputParser), PromptTemplate
+#
+# Flow: Tool 1 (analyze) -> Tool 2 (explain) called in sequence
+# ===================================================================
+
+def build_code_analyzer_tool(llm: ChatOpenAI) -> Tool:
+    """
+    LangChain: Tool wrapping an LCEL chain.
+    Analyzes Python code structure and identifies patterns.
+    """
+    # LangChain: PromptTemplate
+    prompt = PromptTemplate(
+        input_variables=["code"],
+        template=(
+            "You are a senior Python developer. Analyze this code and identify:\n"
+            "- What libraries or modules are imported\n"
+            "- What functions or classes are defined\n"
+            "- What data structures are used\n"
+            "- What the main logic flow is\n"
+            "- Any patterns (web scraping, data processing, API calls, etc.)\n\n"
+            "Code:\n```python\n{code}\n```\n\n"
+            "Provide a detailed technical analysis in 4-6 sentences."
+        ),
+    )
+
+    # LangChain LCEL: prompt | llm | StrOutputParser
+    chain = prompt | llm | StrOutputParser()
+
+    return Tool(
+        name="code_analyzer",
+        func=lambda code: chain.invoke({"code": code}),
+        description="Analyzes Python code structure, imports, and patterns.",
+    )
+
+
+def build_code_explainer_tool(llm: ChatOpenAI) -> Tool:
+    """
+    LangChain: Tool wrapping an LCEL chain.
+    Takes a technical analysis + original code and writes a plain-English explanation.
+    """
+    # LangChain: PromptTemplate
+    prompt = PromptTemplate(
+        input_variables=["analysis", "code"],
+        template=(
+            "You are explaining Python code to a non-technical manager.\n\n"
+            "Your technical analysis of the code:\n{analysis}\n\n"
+            "Original code:\n```python\n{code}\n```\n\n"
+            "Write your response in exactly two sections:\n\n"
+            "REASONING:\n"
+            "Describe what you identified — what features are used, what the "
+            "structure looks like, what patterns you noticed. 3-5 sentences. "
+            "This shows your analysis process.\n\n"
+            "ANSWER:\n"
+            "Explain the code in plain English. Start with what the code does "
+            "overall in one sentence. Then walk through it step by step. "
+            "Cover every function and every important line. "
+            "If there are issues or improvements, mention them at the end. "
+            "Use plain language — no jargon.\n\n"
+            "Use exactly these headers: REASONING: and ANSWER:"
+        ),
+    )
+
+    # LangChain LCEL: prompt | llm | StrOutputParser
+    chain = prompt | llm | StrOutputParser()
+
+    return Tool(
+        name="code_explainer",
+        func=lambda input_str: chain.invoke({
+            "analysis": input_str.split("|||CODE|||")[0],
+            "code": input_str.split("|||CODE|||")[1] if "|||CODE|||" in input_str else "",
+        }),
+        description="Explains code in plain English using the technical analysis.",
+    )
+
+
+def run_code_explainer_pipeline(llm: ChatOpenAI, code: str) -> dict:
+    """
+    Runs two LangChain Tools in sequence:
+      1. code_analyzer  — identifies structure and patterns
+      2. code_explainer — writes plain-English explanation
+    """
+    # Build LangChain Tools
+    analyzer = build_code_analyzer_tool(llm)
+    explainer = build_code_explainer_tool(llm)
+
+    # Step 1: Analyze the code
+    try:
+        analysis = analyzer.run(code)
+    except Exception as e:
+        return {
+            "reasoning": f"Code analysis failed: {str(e)[:200]}",
+            "answer": (
+                "Sorry, there was an error analyzing the code. "
+                "Please try again in a moment."
+            ),
+        }
+
+    # Step 2: Explain using the analysis
+    try:
+        explained = explainer.run(f"{analysis}|||CODE|||{code}")
+    except Exception:
+        explained = f"REASONING:\n{analysis}\n\nANSWER:\n{analysis}"
+
+    # Build execution log
+    agent_log = (
+        f"Step 1:\n"
+        f"  Tool used: code_analyzer\n"
+        f"  Input: [{len(code)} characters of Python code]\n"
+        f"  Output: {analysis[:300]}...\n\n"
+        f"Step 2:\n"
+        f"  Tool used: code_explainer\n"
+        f"  Input: technical analysis + original code\n"
+        f"  Output: plain-English explanation with reasoning"
+    )
+
+    parsed = _parse_reasoning_answer(explained, explained)
+    parsed["agent_steps"] = agent_log
+    return parsed
 
 
 # ===================================================================
 # TOOL 3 — CSV QUERY CHATBOT
 #
-# LangChain components used:
-#   - create_csv_agent (autonomous pandas agent)
-#   - PromptTemplate (for the explanation step)
-#   - LCEL chain: prompt | llm | StrOutputParser
+# LangChain components:
+#   Tool, create_csv_agent, LCEL (prompt|llm|StrOutputParser), PromptTemplate,
+#   ConversationBufferMemory
+#
+# Flow: csv_data_query tool -> result_explainer tool, called in sequence,
+#       with ConversationBufferMemory for follow-up context
 # ===================================================================
 
-def run_csv_query(llm: ChatOpenAI, file_path: str, question: str,
-                  chat_history: list) -> dict:
+def build_csv_query_tool(llm: ChatOpenAI, file_path: str) -> Tool:
     """
-    Queries CSV data and returns a human-readable answer.
-
-    Step 1: Build context from past conversation for follow-ups
-    Step 2: CSV agent writes pandas code and gets raw result
-    Step 3: LLM explains the raw result in plain English
+    LangChain: Tool wrapping create_csv_agent.
+    The csv_agent writes and executes pandas code to answer questions.
     """
-
-    # Build short context from chat history (last 4 messages only)
-    context_lines = []
-    for msg in chat_history[-4:]:
-        role = "You" if msg["role"] == "user" else "Agent"
-        content = msg.get("display", msg["content"])
-        if len(content) > 200:
-            content = content[:200] + "..."
-        context_lines.append(f"{role}: {content}")
-    context = "\n".join(context_lines)
-
-    # Add context for follow-up questions
-    if context:
-        full_question = (
-            f"Context from previous messages:\n{context}\n\n"
-            f"Current question: {question}"
-        )
-    else:
-        full_question = question
-
-    # Step 1: CSV agent queries the data
+    # LangChain: create_csv_agent
+    # number_of_head_rows=5 prevents the agent from dumping the entire
+    # dataframe into the prompt (the #1 cause of the OpenAI 500 error).
+    # max_iterations + early_stopping prevent runaway tool loops.
     csv_agent = create_csv_agent(
         llm,
         file_path,
@@ -202,60 +408,263 @@ def run_csv_query(llm: ChatOpenAI, file_path: str, question: str,
         early_stopping_method="generate",
     )
 
+    def _query(question: str) -> str:
+        result = csv_agent.invoke({"input": question})
+        return str(result["output"])
+
+    return Tool(
+        name="csv_data_query",
+        func=_query,
+        description=(
+            "Queries the CSV dataset using natural language. Input is a "
+            "question about the data. Returns the raw result."
+        ),
+    )
+
+
+def build_csv_explainer_tool(llm: ChatOpenAI, columns: str,
+                              row_count: int) -> Tool:
+    """
+    LangChain: Tool wrapping an LCEL chain.
+    Takes a raw query result and explains it as a proper sentence.
+    """
+    # LangChain: PromptTemplate
+    template_str = (
+        "You are a data analysis chatbot. You queried a CSV file.\n\n"
+        "Dataset: COLUMNS_PLACEHOLDER columns, ROWS_PLACEHOLDER rows.\n\n"
+        "User question: {question}\n\n"
+        "Raw result: {raw_answer}\n\n"
+        "Write exactly two sections:\n\n"
+        "REASONING:\n"
+        "In 2-4 sentences, explain what you did — which columns, what "
+        "operation (counted, averaged, filtered, grouped, etc.), and how "
+        "you arrived at the result.\n\n"
+        "ANSWER:\n"
+        "Present the result conversationally. Do not dump raw lists or "
+        "numbers. Write proper sentences.\n"
+        "- If it is a list, write: 'There are N items: A, B, C, and D.'\n"
+        "- If it is a number, give context: 'The average salary is 95,400.'\n"
+        "- If it is a table, describe the key findings in sentences.\n"
+        "Be specific, complete, and conversational.\n\n"
+        "Use exactly these headers: REASONING: and ANSWER:"
+    )
+    template_str = template_str.replace("COLUMNS_PLACEHOLDER", columns)
+    template_str = template_str.replace("ROWS_PLACEHOLDER", str(row_count))
+
+    prompt = PromptTemplate(
+        input_variables=["question", "raw_answer"],
+        template=template_str,
+    )
+
+    # LangChain LCEL: prompt | llm | StrOutputParser
+    chain = prompt | llm | StrOutputParser()
+
+    def _explain(input_str: str) -> str:
+        parts = input_str.split("|||ANSWER|||")
+        question = parts[0] if len(parts) > 1 else ""
+        raw = parts[1] if len(parts) > 1 else input_str
+        return chain.invoke({"question": question, "raw_answer": raw})
+
+    return Tool(
+        name="result_explainer",
+        func=_explain,
+        description=(
+            "Explains a raw data result in plain English. "
+            "Input format: question|||ANSWER|||raw_result"
+        ),
+    )
+
+
+def get_csv_memory() -> ConversationBufferMemory:
+    """
+    LangChain: ConversationBufferMemory
+    Stores full chat history so the agent understands follow-up questions.
+    """
+    if "csv_memory" not in st.session_state:
+        st.session_state["csv_memory"] = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+        )
+    return st.session_state["csv_memory"]
+
+
+def run_csv_chatbot(llm: ChatOpenAI, file_path: str,
+                    question: str) -> dict:
+    """
+    Two-step pipeline with LangChain memory:
+      1. csv_data_query tool — gets raw answer from CSV
+      2. result_explainer tool — explains it clearly
+
+    ConversationBufferMemory stores past Q&A so follow-ups work.
+    """
+    df = pd.read_csv(file_path)
+    columns = ", ".join(df.columns.tolist())
+    row_count = len(df)
+
+    # Build LangChain Tools
+    query_tool = build_csv_query_tool(llm, file_path)
+    explainer_tool = build_csv_explainer_tool(llm, columns, row_count)
+
+    # LangChain: ConversationBufferMemory
+    memory = get_csv_memory()
+
+    # Build SHORT context from memory — only last 4 messages to avoid
+    # token overflow (CSV agent already uses tokens for the dataframe)
+    chat_history = memory.load_memory_variables({}).get("chat_history", [])
+    context_lines = []
+    for msg in chat_history[-4:]:
+        role = "User" if msg.type == "human" else "Agent"
+        # Truncate long answers to save tokens
+        content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+        context_lines.append(f"{role}: {content}")
+    context = "\n".join(context_lines)
+
+    # Only add context for follow-up questions, keep it short
+    if context:
+        full_question = (
+            f"Context from previous messages:\n{context}\n\n"
+            f"Current question: {question}"
+        )
+    else:
+        full_question = question
+
     try:
-        agent_result = csv_agent.invoke({"input": full_question})
-        raw_answer = str(agent_result["output"])
-    except Exception:
-        # If context makes it too long, retry without context
-        try:
-            agent_result = csv_agent.invoke({"input": question})
-            raw_answer = str(agent_result["output"])
-        except Exception as e:
+        # Step 1: Run csv_data_query tool
+        raw_answer = query_tool.run(full_question)
+    except Exception as e:
+        error_msg = str(e)
+        # If context is making it too long, retry without context
+        if "500" in error_msg or "timeout" in error_msg.lower() or "token" in error_msg.lower():
+            try:
+                raw_answer = query_tool.run(question)
+            except Exception as retry_error:
+                return {
+                    "reasoning": f"The query failed: {str(retry_error)[:200]}",
+                    "answer": (
+                        "Sorry, there was an error querying the data. "
+                        "This usually happens when OpenAI's servers are "
+                        "temporarily overloaded. Please try again in a moment, "
+                        "or try rephrasing with a simpler question."
+                    ),
+                }
+        else:
             return {
+                "reasoning": f"The query failed: {error_msg[:200]}",
                 "answer": (
                     "Sorry, there was an error querying the data. "
                     "Please try again or rephrase your question."
                 ),
-                "raw": str(e)[:200],
             }
 
-    # Step 2: Explain the raw result in plain English
-    df = pd.read_csv(file_path)
-    columns = ", ".join(df.columns.tolist())
+    try:
+        # Step 2: Run result_explainer tool
+        explainer_input = f"{question}|||ANSWER|||{raw_answer}"
+        explained = explainer_tool.run(explainer_input)
+    except Exception:
+        # If explainer fails, return the raw answer directly
+        explained = f"REASONING:\nQueried the data directly.\n\nANSWER:\n{raw_answer}"
 
-    explain_prompt = PromptTemplate(
-        input_variables=["question", "raw_answer", "columns", "row_count"],
-        template=(
-            "You are a data analysis assistant. You just queried a CSV file.\n\n"
-            "Dataset info:\n"
-            "- Columns: {columns}\n"
-            "- Total rows: {row_count}\n\n"
-            "User's question: {question}\n\n"
-            "Raw result from your query: {raw_answer}\n\n"
-            "Present the result in a clear, human-readable way.\n"
-            "Do not just dump a list or a number. Write proper sentences.\n"
-            "If the result is a list, present it as a readable sentence "
-            "(example: 'There are 5 departments: Engineering, Marketing, "
-            "Sales, HR, and Finance.').\n"
-            "If the result is a number, put it in context "
-            "(example: 'The average salary in Engineering is 95,400.').\n"
-            "Be specific, complete, and conversational."
-        ),
+    # Save to LangChain memory (keep stored answers short)
+    answer_text = explained.split("ANSWER:")[-1].strip() if "ANSWER:" in explained else explained
+    memory.save_context(
+        {"input": question},
+        {"output": answer_text[:300]}
     )
 
-    try:
-        explain_chain = explain_prompt | llm | StrOutputParser()
-        explained = explain_chain.invoke({
-            "question": question,
-            "raw_answer": raw_answer,
-            "columns": columns,
-            "row_count": str(len(df)),
-        })
-    except Exception:
-        # If explanation fails, return raw answer directly
-        explained = raw_answer
+    # Build execution log
+    agent_log = (
+        f"Step 1:\n"
+        f"  Tool used: csv_data_query (LangChain create_csv_agent)\n"
+        f"  Input: {question}\n"
+        f"  Raw output: {raw_answer}\n\n"
+        f"Step 2:\n"
+        f"  Tool used: result_explainer (LangChain LCEL chain)\n"
+        f"  Input: question + raw answer\n"
+        f"  Output: human-readable explanation"
+    )
 
-    return {"answer": explained, "raw": raw_answer}
+    parsed = _parse_reasoning_answer(explained, raw_answer)
+    parsed["agent_steps"] = agent_log
+    return parsed
+
+
+# ===================================================================
+# HELPERS
+# ===================================================================
+
+def _parse_reasoning_answer(text: str, fallback: str) -> dict:
+    """Split LLM output on REASONING: and ANSWER: headers."""
+    reasoning = ""
+    answer = ""
+
+    if "REASONING:" in text and "ANSWER:" in text:
+        parts = text.split("ANSWER:")
+        reasoning_part = parts[0]
+        answer = parts[1].strip() if len(parts) > 1 else str(fallback)
+
+        if "REASONING:" in reasoning_part:
+            reasoning = reasoning_part.split("REASONING:")[1].strip()
+        else:
+            reasoning = reasoning_part.strip()
+    else:
+        answer = text.strip()
+        reasoning = "Processed the input and generated a response."
+
+    return {"reasoning": reasoning, "answer": answer}
+
+
+def display_result(result: dict, langchain_components: list):
+    """Display answer, LangChain tags, reasoning, and agent log."""
+    st.markdown("**Answer**")
+    st.markdown(
+        f'<div class="result-box">{result["answer"]}</div>',
+        unsafe_allow_html=True,
+    )
+
+    tags_html = " ".join(
+        f'<span class="langchain-tag">{c}</span>' for c in langchain_components
+    )
+    st.markdown(
+        f'<div style="margin-top:0.75rem;">'
+        f'<span style="font-size:0.8rem;color:#777;">LangChain: </span>'
+        f'{tags_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How the agent reached this answer"):
+        st.markdown(
+            f'<div class="reasoning-box">{result["reasoning"]}</div>',
+            unsafe_allow_html=True,
+        )
+        if result.get("agent_steps"):
+            st.markdown("**Agent execution log**")
+            st.code(result["agent_steps"], language="text")
+
+
+def display_chat_message(msg: dict):
+    """Display a single assistant chat message with tags and reasoning."""
+    st.write(msg["answer"])
+
+    tags = ["Tool", "create_csv_agent", "LCEL (prompt|llm)",
+            "PromptTemplate", "ConversationBufferMemory"]
+    tags_html = " ".join(
+        f'<span class="langchain-tag">{c}</span>' for c in tags
+    )
+    st.markdown(
+        f'<div style="margin-top:0.5rem;">'
+        f'<span style="font-size:0.8rem;color:#777;">LangChain: </span>'
+        f'{tags_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How the agent reached this answer"):
+        st.markdown(
+            f'<div class="reasoning-box">{msg["reasoning"]}</div>',
+            unsafe_allow_html=True,
+        )
+        if msg.get("agent_steps"):
+            st.markdown("**Agent execution log**")
+            st.code(msg["agent_steps"], language="text")
 
 
 # ===================================================================
@@ -263,8 +672,8 @@ def run_csv_query(llm: ChatOpenAI, file_path: str, question: str,
 # ===================================================================
 st.header("LangChain Multi-Tool Assistant")
 st.write(
-    "Pick a tool from the sidebar, paste your input, and get results. "
-    "Each tool runs through a dedicated LangChain chain or agent."
+    "Pick a tool from the sidebar. Every tool is built with LangChain "
+    "components — Tools, Chains, and Memory."
 )
 
 if not api_key:
@@ -276,12 +685,14 @@ if not api_key:
 
 llm = get_llm(api_key)
 
+
 # ---- Text Summarizer ----
 if tool_choice == "Text Summarizer":
-    st.subheader("Text Summarizer")
+    st.subheader("Text Summarizer Agent")
     st.write(
-        "Paste any long text below. The tool splits it into chunks, "
-        "summarizes each chunk, then merges the summaries into one result."
+        "Paste any long text below. Two LangChain Tools run in sequence — "
+        "the first splits and summarizes (map-reduce), the second explains "
+        "the result with full reasoning."
     )
 
     input_text = st.text_area(
@@ -294,24 +705,22 @@ if tool_choice == "Text Summarizer":
         if not input_text.strip():
             st.warning("Please paste some text first.")
         else:
-            with st.spinner("Summarizing..."):
-                try:
-                    summary = run_summarizer(llm, input_text)
-                except Exception as e:
-                    summary = f"Error: {str(e)[:300]}"
+            with st.spinner("Agent is reading and summarizing..."):
+                result = run_summarizer_pipeline(llm, input_text)
+            display_result(result, [
+                "Tool", "load_summarize_chain",
+                "RecursiveCharacterTextSplitter", "Document",
+                "LCEL (prompt|llm)", "PromptTemplate",
+            ])
 
-            st.markdown("**Summary**")
-            st.markdown(
-                f'<div class="result-box">{summary}</div>',
-                unsafe_allow_html=True,
-            )
 
 # ---- Code Explainer ----
 elif tool_choice == "Code Explainer":
-    st.subheader("Python Code Explainer")
+    st.subheader("Code Explainer Agent")
     st.write(
-        "Paste a Python snippet below. The tool will explain what the code "
-        "does in plain English, step by step."
+        "Paste a Python snippet below. Two LangChain Tools run in sequence — "
+        "the first analyzes the code structure, the second explains it "
+        "in plain English."
     )
 
     input_code = st.text_area(
@@ -324,28 +733,23 @@ elif tool_choice == "Code Explainer":
         if not input_code.strip():
             st.warning("Please paste some code first.")
         else:
-            with st.spinner("Analyzing code..."):
-                try:
-                    explanation = run_code_explainer(llm, input_code)
-                except Exception as e:
-                    explanation = f"Error: {str(e)[:300]}"
+            with st.spinner("Agent is analyzing the code..."):
+                result = run_code_explainer_pipeline(llm, input_code)
+            display_result(result, [
+                "Tool", "LCEL (prompt|llm)", "PromptTemplate",
+            ])
 
-            st.markdown("**Explanation**")
-            st.markdown(
-                f'<div class="result-box">{explanation}</div>',
-                unsafe_allow_html=True,
-            )
 
 # ---- CSV Query Chatbot ----
 elif tool_choice == "CSV Query Chatbot":
     st.subheader("CSV Query Chatbot")
     st.write(
-        "Upload a CSV file and chat with your data. Ask questions, "
-        "follow up on answers, and dig deeper — the chatbot remembers "
-        "the conversation."
+        "Upload a CSV file and chat with your data. Two LangChain Tools "
+        "handle each message — csv_data_query runs pandas code, "
+        "result_explainer presents the answer. ConversationBufferMemory "
+        "keeps track of the conversation for follow-ups."
     )
 
-    # Initialize chat history
     if "csv_chat_history" not in st.session_state:
         st.session_state["csv_chat_history"] = []
     if "csv_file_path" not in st.session_state:
@@ -354,7 +758,6 @@ elif tool_choice == "CSV Query Chatbot":
     uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
 
     if uploaded_file is not None:
-        # Save file — only re-save if it is a new file
         current_name = uploaded_file.name
         if st.session_state.get("csv_file_name") != current_name:
             with tempfile.NamedTemporaryFile(
@@ -364,10 +767,10 @@ elif tool_choice == "CSV Query Chatbot":
                 st.session_state["csv_file_path"] = tmp.name
                 st.session_state["csv_file_name"] = current_name
                 st.session_state["csv_chat_history"] = []
+                st.session_state.pop("csv_memory", None)
 
         file_path = st.session_state["csv_file_path"]
 
-        # Show data preview in a collapsible section
         df = pd.read_csv(file_path)
         with st.expander(
             f"Data preview — {len(df)} rows, {len(df.columns)} columns",
@@ -378,19 +781,18 @@ elif tool_choice == "CSV Query Chatbot":
 
         st.divider()
 
-        # Display chat history
+        # Render chat history
         for msg in st.session_state["csv_chat_history"]:
             with st.chat_message(msg["role"]):
                 if msg["role"] == "user":
                     st.write(msg["content"])
                 else:
-                    st.write(msg["display"])
+                    display_chat_message(msg)
 
         # Chat input
         question = st.chat_input("Ask a question about your data...")
 
         if question:
-            # Show user message
             with st.chat_message("user"):
                 st.write(question)
 
@@ -399,23 +801,22 @@ elif tool_choice == "CSV Query Chatbot":
                 "content": question,
             })
 
-            # Run the query
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    result = run_csv_query(
-                        llm,
-                        file_path,
-                        question,
-                        st.session_state["csv_chat_history"],
-                    )
+                    result = run_csv_chatbot(llm, file_path, question)
 
-                st.write(result["answer"])
+                display_chat_message({
+                    "answer": result["answer"],
+                    "reasoning": result["reasoning"],
+                    "agent_steps": result.get("agent_steps", ""),
+                })
 
-            # Save assistant message to history
             st.session_state["csv_chat_history"].append({
                 "role": "assistant",
                 "content": result["answer"],
-                "display": result["answer"],
+                "answer": result["answer"],
+                "reasoning": result["reasoning"],
+                "agent_steps": result.get("agent_steps", ""),
             })
 
     else:
