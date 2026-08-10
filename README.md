@@ -30,7 +30,7 @@ These were chosen because they cover three different LangChain patterns that mat
 
 ## Architecture
 
-Every tool follows a two-step agent pattern: first it does the actual work (summarize, analyze, or query), then it passes the raw result to a second LLM call that explains the reasoning and presents a clean, human-readable answer.
+Every tool is built using LangChain's core components: `Tool` (callable functions), `initialize_agent` (agent framework), `LLMChain` + `PromptTemplate` (prompt-driven chains), and `ConversationBufferMemory` (chat history). Each agent has multiple LangChain Tools registered with it and decides which tool to call and in what order.
 
 ```
 User (Browser)
@@ -38,27 +38,44 @@ User (Browser)
     v
 Streamlit UI  (app.py)
     |
-    |--- Sidebar: tool selector
+    +--- ChatOpenAI (shared LLM instance, gpt-3.5-turbo)
     |
-    |--- Agent 1: Text Summarizer
+    |--- Agent 1: Text Summarizer  [initialize_agent, ZERO_SHOT_REACT_DESCRIPTION]
     |       |
-    |       +-- Step 1: RecursiveCharacterTextSplitter + load_summarize_chain (map_reduce)
-    |       +-- Step 2: LLMChain explains what it did + presents clean summary
-    |       +-- Output: REASONING (how it chunked and merged) + ANSWER (final summary)
-    |
-    |--- Agent 2: Code Explainer
+    |       +-- Tool: text_summarizer
+    |       |     +-- RecursiveCharacterTextSplitter (splits text into chunks)
+    |       |     +-- Document (wraps each chunk)
+    |       |     +-- load_summarize_chain (map_reduce — summarize + merge)
     |       |
-    |       +-- Step 1+2 combined: Single LLMChain with structured prompt
-    |       +-- The prompt forces the LLM to first reason about the code structure,
-    |       |   then explain it in plain English
-    |       +-- Output: REASONING (what patterns it found) + ANSWER (explanation)
+    |       +-- Tool: summary_explainer
+    |       |     +-- PromptTemplate (explanation prompt)
+    |       |     +-- LLMChain (runs prompt through LLM)
+    |       |
+    |       +-- Agent decides: summarize first, then explain
     |
-    |--- Agent 3: CSV Query
+    |--- Agent 2: Code Explainer  [initialize_agent, ZERO_SHOT_REACT_DESCRIPTION]
+    |       |
+    |       +-- Tool: code_analyzer
+    |       |     +-- PromptTemplate (analysis prompt)
+    |       |     +-- LLMChain (identifies structure + patterns)
+    |       |
+    |       +-- Tool: code_explainer
+    |       |     +-- PromptTemplate (explanation prompt)
+    |       |     +-- LLMChain (plain-English explanation)
+    |       |
+    |       +-- Agent decides: analyze first, then explain
+    |
+    |--- Agent 3: CSV Query Chatbot  [initialize_agent, CONVERSATIONAL_REACT_DESCRIPTION]
             |
-            +-- Step 1: create_csv_agent (writes pandas code, executes it, returns raw result)
-            +-- Step 2: LLMChain takes the raw result and explains it in context
-            +-- Output: REASONING (what columns/operations it used) + ANSWER (readable result)
-            +-- Bonus: Agent execution log (the actual pandas steps it ran)
+            +-- Tool: csv_data_query
+            |     +-- create_csv_agent (writes + executes pandas code)
+            |
+            +-- Tool: result_explainer
+            |     +-- PromptTemplate (explanation prompt)
+            |     +-- LLMChain (human-readable answer)
+            |
+            +-- ConversationBufferMemory (stores full chat history)
+            +-- Agent uses memory to understand follow-up questions
 ```
 
 All three agents share the same `ChatOpenAI` instance (GPT-3.5-turbo, temperature 0.3), created once and reused across the session.
@@ -214,17 +231,23 @@ result = explain_chain.invoke({
 
 ---
 
-## LangChain Concepts Demonstrated
+## LangChain Components Used
 
-| Concept | Where it appears | What it means |
-|---------|-----------------|---------------|
-| **Agent** | CSV Query (autonomous), all three (reasoning pattern) | An Agent decides its own steps — it reasons, acts, observes, and repeats |
-| **Chain** | Summarizer, Code Explainer, explanation step in all | A Chain is a fixed sequence: prompt goes in, answer comes out |
-| **PromptTemplate** | All three agents | A reusable template with placeholders filled at runtime |
-| **Text Splitter** | Summarizer | Breaks long text into overlapping chunks that fit the context window |
-| **Intermediate Steps** | CSV Query Chatbot | The agent's internal thought process — what code it wrote and what it observed |
-| **Two-step pattern** | Summarizer and CSV Chatbot | Raw result from step 1 is explained by step 2 — separates computation from presentation |
-| **Conversation History** | CSV Query Chatbot | Past messages are passed as context so the agent understands follow-up questions |
+| Component | Where | What it does |
+|-----------|-------|-------------|
+| **ChatOpenAI** | All three agents | LLM wrapper — connects to OpenAI's GPT-3.5-turbo |
+| **Tool** | All three agents (6 tools total) | Wraps a Python function so a LangChain agent can call it |
+| **initialize_agent** | All three agents | Creates an agent that decides which tools to use and in what order |
+| **ZERO_SHOT_REACT_DESCRIPTION** | Summarizer, Code Explainer | Agent type that reasons about tools using their descriptions |
+| **CONVERSATIONAL_REACT_DESCRIPTION** | CSV Chatbot | Agent type designed for multi-turn conversations with memory |
+| **LLMChain** | All three agents | Connects a PromptTemplate to the LLM — prompt goes in, answer comes out |
+| **PromptTemplate** | All three agents | Reusable prompt with placeholders filled at runtime |
+| **load_summarize_chain** | Summarizer | Map-reduce chain — summarizes chunks, then merges |
+| **RecursiveCharacterTextSplitter** | Summarizer | Splits long text into overlapping chunks |
+| **Document** | Summarizer | Wraps a text chunk so chains can process it |
+| **create_csv_agent** | CSV Chatbot | Autonomous agent that writes and executes pandas code |
+| **ConversationBufferMemory** | CSV Chatbot | Stores full chat history so the agent understands follow-ups |
+| **return_intermediate_steps** | All three agents | Captures the agent's internal reasoning — which tools it called and why |
 
 ---
 
