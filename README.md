@@ -12,7 +12,7 @@ Instead of building three separate apps, this project packages three common text
 |------|-------------|--------------------------|
 | **Text Summarizer** | Condenses long articles or reports into a short summary | `load_summarize_chain` (map_reduce strategy) |
 | **Code Explainer** | Explains Python code in plain English, step by step | `LLMChain` with a custom `PromptTemplate` |
-| **CSV Query** | Answers natural-language questions about uploaded CSV data | `create_csv_agent` (writes and runs pandas code internally) |
+| **CSV Query Chatbot** | Conversational agent — ask questions about CSV data, follow up, dig deeper | `create_csv_agent` + conversation history |
 
 ---
 
@@ -24,11 +24,13 @@ These were chosen because they cover three different LangChain patterns that mat
 
 2. **Code Explainer** shows the simplest and most common LangChain pattern: a prompt template fed into an LLM chain. The prompt tells the model to behave like a senior developer explaining code to a non-technical person. This pattern is the building block for most LangChain applications.
 
-3. **CSV Query** shows LangChain's agent framework. Unlike a simple chain where we control every step, the agent decides on its own what pandas code to write and execute to answer the user's question. This is the most autonomous pattern and demonstrates how LangChain agents reason and act.
+3. **CSV Query Chatbot** shows LangChain's agent framework running as a chatbot. Unlike a single-shot tool, the chatbot maintains conversation history so the user can ask follow-up questions like "what about the Engineering department?" or "show me the top 3 from that list." The agent uses the previous messages as context to understand references like "them," "those," and "the same column."
 
 ---
 
 ## Architecture
+
+Every tool follows a two-step agent pattern: first it does the actual work (summarize, analyze, or query), then it passes the raw result to a second LLM call that explains the reasoning and presents a clean, human-readable answer.
 
 ```
 User (Browser)
@@ -36,28 +38,30 @@ User (Browser)
     v
 Streamlit UI  (app.py)
     |
-    |--- Sidebar: API key input + tool selector
+    |--- Sidebar: tool selector
     |
-    |--- Tool 1: Text Summarizer
+    |--- Agent 1: Text Summarizer
     |       |
-    |       +-- RecursiveCharacterTextSplitter (splits long text into chunks)
-    |       +-- load_summarize_chain (map_reduce)
-    |       +-- ChatOpenAI (LLM)
+    |       +-- Step 1: RecursiveCharacterTextSplitter + load_summarize_chain (map_reduce)
+    |       +-- Step 2: LLMChain explains what it did + presents clean summary
+    |       +-- Output: REASONING (how it chunked and merged) + ANSWER (final summary)
     |
-    |--- Tool 2: Code Explainer
+    |--- Agent 2: Code Explainer
     |       |
-    |       +-- PromptTemplate (structured prompt)
-    |       +-- LLMChain (prompt + LLM)
-    |       +-- ChatOpenAI (LLM)
+    |       +-- Step 1+2 combined: Single LLMChain with structured prompt
+    |       +-- The prompt forces the LLM to first reason about the code structure,
+    |       |   then explain it in plain English
+    |       +-- Output: REASONING (what patterns it found) + ANSWER (explanation)
     |
-    |--- Tool 3: CSV Query
+    |--- Agent 3: CSV Query
             |
-            +-- create_csv_agent (autonomous agent)
-            +-- pandas (data manipulation, executed by agent)
-            +-- ChatOpenAI (LLM)
+            +-- Step 1: create_csv_agent (writes pandas code, executes it, returns raw result)
+            +-- Step 2: LLMChain takes the raw result and explains it in context
+            +-- Output: REASONING (what columns/operations it used) + ANSWER (readable result)
+            +-- Bonus: Agent execution log (the actual pandas steps it ran)
 ```
 
-All three tools share the same `ChatOpenAI` instance (GPT-3.5-turbo, temperature 0.3), which is created once and reused across the session.
+All three agents share the same `ChatOpenAI` instance (GPT-3.5-turbo, temperature 0.3), created once and reused across the session.
 
 ---
 
@@ -126,83 +130,87 @@ streamlit run app.py
 
 ---
 
-## How Each Tool Works (Technical Detail)
+## How Each Agent Works (Technical Detail)
 
-### Text Summarizer
+All three agents follow the same output pattern: they produce a **REASONING** section (what the agent did and why) and an **ANSWER** section (the clean, human-readable result). The UI shows the answer prominently and puts the reasoning in a collapsible panel.
 
-**Problem:** A user pastes a 5,000-word article. GPT-3.5-turbo has a context window limit, and even if the text fits, summarizing very long text in one shot often produces poor results.
+### Text Summarizer Agent
 
-**Solution:** LangChain's `load_summarize_chain` with the `map_reduce` strategy.
+**Problem:** A user pastes a 5,000-word article. Summarizing very long text in one shot produces poor results, and the user gets no visibility into what happened.
+
+**Solution:** A two-step agent. Step 1 uses LangChain's `load_summarize_chain` (map-reduce) to produce a raw summary. Step 2 passes that raw summary to a second LLMChain that explains the process and presents a polished result.
 
 **Step-by-step flow:**
 
-1. The input text is split into chunks of ~3,000 characters each using `RecursiveCharacterTextSplitter`. Adjacent chunks overlap by 200 characters so no sentence is cut in half.
-2. Each chunk is wrapped in a LangChain `Document` object.
-3. The map step: each chunk is summarized independently by the LLM.
-4. The reduce step: all chunk-level summaries are combined and summarized again into one final output.
+1. The input text is split into chunks of ~3,000 characters using `RecursiveCharacterTextSplitter`.
+2. Each chunk is summarized independently (map step).
+3. All chunk summaries are merged into one (reduce step).
+4. A second LLMChain receives the raw summary plus metadata (character count, chunk count) and writes both the REASONING and ANSWER sections.
 
-**Key code:**
+**What the user sees:**
 
-```python
-splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
-chunks = splitter.split_text(text)
-docs = [Document(page_content=c) for c in chunks]
-chain = load_summarize_chain(llm, chain_type="map_reduce")
-result = chain.invoke(docs)
-```
+- **Answer:** A clean, readable paragraph summarizing the text.
+- **Reasoning (expandable):** "I split the 12,400-character text into 5 chunks. The text was about renewable energy policy in Southeast Asia. I summarized each chunk separately, then merged the results into one coherent summary."
 
-### Code Explainer
+### Code Explainer Agent
 
-**Problem:** A manager or a junior developer needs to understand what a Python script does, without reading the code line by line.
+**Problem:** A non-technical person needs to understand what a Python script does, and a raw explanation without context is hard to follow.
 
-**Solution:** A `PromptTemplate` + `LLMChain`. The prompt instructs the model to act as a senior developer explaining code to a non-technical audience.
+**Solution:** A single LLMChain with a structured prompt that forces the model to first analyze the code (identify patterns, structures, imports), then explain it step by step.
 
 **Step-by-step flow:**
 
 1. The user pastes Python code.
-2. The code is injected into a prompt template that sets the tone and format.
-3. The LLMChain sends the completed prompt to the model.
-4. The model returns a plain-English walkthrough.
+2. The prompt instructs the LLM to first reason about the code structure (what it identified), then explain it in plain English.
+3. The LLM returns both sections in one response.
 
-**Key code:**
+**What the user sees:**
 
-```python
-prompt = PromptTemplate(
-    input_variables=["code"],
-    template="You are a senior Python developer explaining code to a "
-             "non-technical manager. ... Code:\n{code}\nExplanation:"
-)
-chain = LLMChain(llm=llm, prompt=prompt)
-result = chain.invoke({"code": code})
-```
+- **Answer:** "This code connects to a website, downloads the page, and pulls out all the headlines. It uses two external libraries — one to fetch the page and one to read its structure."
+- **Reasoning (expandable):** "I identified a function using the requests library for HTTP calls and BeautifulSoup for HTML parsing. The code uses a list comprehension to extract h2 tags."
 
-### CSV Query
+### CSV Query Agent
 
-**Problem:** A user has a CSV file and wants answers — "What is the average salary by department?" — without writing pandas code.
+**Problem:** A user asks "What departments exist in this data?" and gets back `['Engineering', 'Marketing', 'Sales', 'HR', 'Finance']`. That is technically correct but not useful — the user wants a sentence, not a Python list.
 
-**Solution:** LangChain's `create_csv_agent`. This creates an autonomous agent that reads the CSV, figures out the right pandas operations, executes them, and returns the answer.
+**Solution:** A two-step agent. Step 1 uses LangChain's `create_csv_agent` which autonomously writes and executes pandas code. Step 2 passes the raw result to a second LLMChain that explains what happened and presents the answer as a proper sentence.
 
 **Step-by-step flow:**
 
-1. The user uploads a CSV file. It is saved to a temporary file.
-2. A preview (first 10 rows) is shown so the user can see the column names.
-3. The user types a question in natural language.
-4. The agent reads the CSV, decides what pandas code to run, executes it in a sandboxed environment, and returns the answer.
+1. The user uploads a CSV file. A preview is shown.
+2. The user types a question in natural language.
+3. The CSV agent decides what pandas code to run, executes it, and returns a raw result.
+4. The intermediate steps (what code the agent wrote, what it observed) are captured.
+5. A second LLMChain receives the raw result, the column names, and the row count, then writes the REASONING and ANSWER sections.
+
+**What the user sees:**
+
+- **Answer:** "There are 5 departments in the dataset: Engineering, Marketing, Sales, HR, and Finance. Engineering has the most employees with 5 people."
+- **Reasoning (expandable):** "I looked at the 'department' column across all 15 rows. I used a unique-values operation to find the distinct departments, then counted the occurrences of each."
+- **Agent execution log (expandable):** The actual pandas operations the agent ran, step by step.
 
 **Key code:**
 
 ```python
-agent = create_csv_agent(
-    llm,
-    file_path,
-    verbose=False,
+csv_agent = create_csv_agent(
+    llm, file_path,
     agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
     allow_dangerous_code=True,
+    return_intermediate_steps=True,  # captures the agent's thought process
 )
-result = agent.invoke({"input": question})
+agent_result = csv_agent.invoke({"input": question})
+
+# Step 2: explain the raw result
+explain_chain = LLMChain(llm=llm, prompt=explain_prompt)
+result = explain_chain.invoke({
+    "question": question,
+    "raw_answer": agent_result["output"],
+    "columns": col_info,
+    "row_count": str(len(df)),
+})
 ```
 
-**Note on `allow_dangerous_code=True`:** The CSV agent needs to execute Python code (pandas operations) to answer questions. LangChain requires this flag as an explicit opt-in. In a production deployment, you would run this inside a sandboxed container.
+**Note on `allow_dangerous_code=True`:** The CSV agent executes Python code (pandas operations) to answer questions. LangChain requires this flag as an explicit opt-in. In a production deployment, you would run this inside a sandboxed container.
 
 ---
 
@@ -210,12 +218,13 @@ result = agent.invoke({"input": question})
 
 | Concept | Where it appears | What it means |
 |---------|-----------------|---------------|
-| **Tool** | All three utilities are wrapped as `Tool` objects | A Tool is a function with a name and description that LangChain can call |
-| **Chain** | Summarizer and Code Explainer | A Chain is a fixed sequence of steps: prompt goes in, answer comes out |
-| **Agent** | CSV Query | An Agent decides its own steps. It reasons about what to do, acts, observes the result, and repeats until it has an answer |
-| **PromptTemplate** | Code Explainer | A reusable template with placeholders that get filled at runtime |
-| **Text Splitter** | Summarizer | Breaks long text into overlapping chunks that fit the model's context window |
-| **Document** | Summarizer | LangChain's standard wrapper for a piece of text plus optional metadata |
+| **Agent** | CSV Query (autonomous), all three (reasoning pattern) | An Agent decides its own steps — it reasons, acts, observes, and repeats |
+| **Chain** | Summarizer, Code Explainer, explanation step in all | A Chain is a fixed sequence: prompt goes in, answer comes out |
+| **PromptTemplate** | All three agents | A reusable template with placeholders filled at runtime |
+| **Text Splitter** | Summarizer | Breaks long text into overlapping chunks that fit the context window |
+| **Intermediate Steps** | CSV Query Chatbot | The agent's internal thought process — what code it wrote and what it observed |
+| **Two-step pattern** | Summarizer and CSV Chatbot | Raw result from step 1 is explained by step 2 — separates computation from presentation |
+| **Conversation History** | CSV Query Chatbot | Past messages are passed as context so the agent understands follow-up questions |
 
 ---
 
@@ -240,14 +249,26 @@ def scrape_headlines(url):
     return headlines[:10]
 ```
 
-### CSV Query
+### CSV Query Chatbot
 
-Upload the included `sample_data.csv` and try:
+Upload the included `sample_data.csv` and try this conversation flow:
 
-- "How many employees are in each department?"
-- "What is the average salary in Engineering?"
-- "Who has the most experience?"
-- "List all employees in Chennai."
+```
+You:   How many employees are in each department?
+Agent: There are 5 departments. Engineering has 5 employees, Marketing has 2, ...
+
+You:   Which one has the highest average salary?
+Agent: Among those departments, Finance has the highest average salary at 104,000...
+
+You:   List the people in that department.
+Agent: The Finance department has 2 employees: Lakshmi Pillai (Financial Analyst)
+       and Amit Patel (Finance Manager)...
+
+You:   Who earns more between them?
+Agent: Amit Patel earns more at 130,000 compared to Lakshmi Pillai at 78,000...
+```
+
+The chatbot understands follow-ups like "that department," "between them," and "which one" because it keeps the full conversation history.
 
 ---
 
@@ -290,5 +311,3 @@ ChatOpenAI(model="gpt-4", temperature=0.3, openai_api_key=api_key)
 ## License
 
 MIT
-#   W o r k s b o t - t a s k - 4  
- 
