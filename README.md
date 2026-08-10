@@ -334,4 +334,10 @@ ChatOpenAI(model="gpt-4", temperature=0.3, openai_api_key=api_key)
 # output 
 <img width="1917" height="1077" alt="Screenshot 2026-08-10 095407" src="https://github.com/user-attachments/assets/6f1f3f6f-4dfe-428a-a7d5-80177cff6ca4" />
 
+<img width="1896" height="1068" alt="Screenshot 2026-08-10 095334" src="https://github.com/user-attachments/assets/b09dc1ae-9893-4d3c-9d61-c8e92c00a765" />
+
+<img width="1911" height="1072" alt="Screenshot 2026-08-10 103834" src="https://github.com/user-attachments/assets/ca4d42ba-80b2-4da6-a0e8-12df40c4bd30" />
+
+
+
 
